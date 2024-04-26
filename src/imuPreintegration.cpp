@@ -458,9 +458,12 @@ public:
     void imuHandler(const sensor_msgs::Imu::ConstPtr& imu_raw)
     {
         std::lock_guard<std::mutex> lock(mtx);
-
+        
+        // eigen to ros type
         sensor_msgs::Imu thisImu = imuConverter(*imu_raw);
 
+        //一个queue执行预积分和位姿优化
+        //一个queue用来更新
         imuQueOpt.push_back(thisImu);
         imuQueImu.push_back(thisImu);
 
