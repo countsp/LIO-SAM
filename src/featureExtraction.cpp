@@ -78,6 +78,7 @@ public:
         publishFeatureCloud();
     }
 
+    // 计算曲率
     void calculateSmoothness()
     {
         int cloudSize = extractedCloud->points.size();
