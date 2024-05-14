@@ -148,6 +148,7 @@ public:
 
     void imuHandler(const sensor_msgs::Imu::ConstPtr& imuMsg)
     {
+        //imu坐标转换
         sensor_msgs::Imu thisImu = imuConverter(*imuMsg);
 
         std::lock_guard<std::mutex> lock1(imuLock);
@@ -197,6 +198,7 @@ public:
     bool cachePointCloud(const sensor_msgs::PointCloud2ConstPtr& laserCloudMsg)
     {
         // cache point cloud
+        // 保存点云到队列
         cloudQueue.push_back(*laserCloudMsg);
         if (cloudQueue.size() <= 2)
             return false;
@@ -238,6 +240,7 @@ public:
         timeScanEnd = timeScanCur + laserCloudIn->points.back().time;
 
         // check dense flag
+        // is_dense判断点云是否有序排列
         if (laserCloudIn->is_dense == false)
         {
             ROS_ERROR("Point cloud is not in dense format, please remove NaN points first!");
@@ -245,6 +248,7 @@ public:
         }
 
         // check ring channel
+        // 检查点有没有对应的scan号
         static int ringFlag = 0;
         if (ringFlag == 0)
         {
@@ -283,12 +287,14 @@ public:
         return true;
     }
 
+    // 获取运动补偿所需信息
     bool deskewInfo()
     {
         std::lock_guard<std::mutex> lock1(imuLock);
         std::lock_guard<std::mutex> lock2(odoLock);
 
         // make sure IMU data available for the scan
+        // 确保imu数据能够覆盖点云
         if (imuQueue.empty() || imuQueue.front().header.stamp.toSec() > timeScanCur || imuQueue.back().header.stamp.toSec() < timeScanEnd)
         {
             ROS_DEBUG("Waiting for IMU data ...");
@@ -308,6 +314,7 @@ public:
 
         while (!imuQueue.empty())
         {
+            //扔掉过早的imu数据
             if (imuQueue.front().header.stamp.toSec() < timeScanCur - 0.01)
                 imuQueue.pop_front();
             else
@@ -486,7 +493,7 @@ public:
         // *posZCur = ratio * odomIncreZ;
     }
 
-    PointType deskewPoint(PointType *point, double relTime)
+    PointType deskewPoint(PointType *point, double relTime) //线性插值补偿
     {
         if (deskewFlag == -1 || cloudInfo.imuAvailable == false)
             return *point;
@@ -518,6 +525,7 @@ public:
         return newPoint;
     }
 
+    //点云投影到矩阵上，并保存每个点的信息
     void projectPointCloud()
     {
         int cloudSize = laserCloudIn->points.size();
@@ -530,10 +538,12 @@ public:
             thisPoint.z = laserCloudIn->points[i].z;
             thisPoint.intensity = laserCloudIn->points[i].intensity;
 
+            //计算这个点到lidar中心距离，距离要在合适值内
             float range = pointDistance(thisPoint);
             if (range < lidarMinRange || range > lidarMaxRange)
                 continue;
 
+            //取出scan线数
             int rowIdn = laserCloudIn->points[i].ring;
             if (rowIdn < 0 || rowIdn >= N_SCAN)
                 continue;
@@ -541,9 +551,11 @@ public:
             if (rowIdn % downsampleRate != 0)
                 continue;
 
+            
             int columnIdn = -1;
             if (sensor == SensorType::VELODYNE || sensor == SensorType::OUSTER)
             {
+                // 计算水平角
                 float horizonAngle = atan2(thisPoint.x, thisPoint.y) * 180 / M_PI;
                 static float ang_res_x = 360.0/float(Horizon_SCAN);
                 columnIdn = -round((horizonAngle-90.0)/ang_res_x) + Horizon_SCAN/2;
@@ -562,15 +574,22 @@ public:
             if (rangeMat.at<float>(rowIdn, columnIdn) != FLT_MAX)
                 continue;
 
+            //线性运动补偿
             thisPoint = deskewPoint(&thisPoint, laserCloudIn->points[i].time);
 
+            //放入range矩阵中
             rangeMat.at<float>(rowIdn, columnIdn) = range;
 
+            //算出索引
             int index = columnIdn + rowIdn * Horizon_SCAN;
+
+            //保存点的坐标
             fullCloud->points[index] = thisPoint;
         }
     }
 
+
+    // 提取有效点的信息
     void cloudExtraction()
     {
         int count = 0;
