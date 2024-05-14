@@ -41,8 +41,9 @@ public:
     double lidarOdomTime = -1;
     deque<nav_msgs::Odometry> imuOdomQueue;
 
-    TransformFusion()
+    TransformFusion() //使用imu积分节点得到增量，补偿到带回环的里程计，得到位姿
     {
+        // 如果lidar和baselink不是一个坐标系
         if(lidarFrame != baselinkFrame)
         {
             try
@@ -133,6 +134,8 @@ public:
         static nav_msgs::Path imuPath;
         static double last_path_time = -1;
         double imuTime = imuOdomQueue.back().header.stamp.toSec();
+        
+        //频率不超过10hz
         if (imuTime - last_path_time > 0.1)
         {
             last_path_time = imuTime;
@@ -286,24 +289,37 @@ public:
                 else
                     break;
             }
+
+            // 添加约束
             // initial pose
+            //将lidar的位姿转到imu坐标系下
             prevPose_ = lidarPose.compose(lidar2Imu);
+            // 设置第0个pose3约束X（0）的初始位姿和置信度0.01（较高）
             gtsam::PriorFactor<gtsam::Pose3> priorPose(X(0), prevPose_, priorPoseNoise);
+            // 约束加入因子图
             graphFactors.add(priorPose);
+            
             // initial velocity
             prevVel_ = gtsam::Vector3(0, 0, 0);
+            // 设置约束V（0）的速度和置信度0.001（低一些）
             gtsam::PriorFactor<gtsam::Vector3> priorVel(V(0), prevVel_, priorVelNoise);
             graphFactors.add(priorVel);
+            
             // initial bias
             prevBias_ = gtsam::imuBias::ConstantBias();
+            // 设置约束B（0）偏置（较高）
             gtsam::PriorFactor<gtsam::imuBias::ConstantBias> priorBias(B(0), prevBias_, priorBiasNoise);
             graphFactors.add(priorBias);
-            // add values
+
+            
+            // add values 添加状态量
             graphValues.insert(X(0), prevPose_);
             graphValues.insert(V(0), prevVel_);
             graphValues.insert(B(0), prevBias_);
+            
             // optimize once
             optimizer.update(graphFactors, graphValues);
+            // update到优化器后清零
             graphFactors.resize(0);
             graphValues.clear();
 
@@ -317,6 +333,7 @@ public:
 
 
         // reset graph for speed
+        // 当isam优化器里约束太多了，避免时间过长就清空了
         if (key == 100)
         {
             // get updated noise before reset
@@ -347,19 +364,23 @@ public:
         }
 
 
-        // 1. integrate imu data and optimize
+        // 1. integrate imu data and optimize（第一步imu预积分，第二步转为约束、第三步设定约束内容、第四步加入因子图、第五步零偏加入因子图、第六步lidar加入因子图、最后根据上一帧对当前状态进行预测）
         while (!imuQueOpt.empty())
         {
             // pop and integrate imu data that is between two optimizations
             sensor_msgs::Imu *thisImu = &imuQueOpt.front();
             double imuTime = ROS_TIME(thisImu);
+            // 把小于imu时间的lidar位姿取出来（n-1~n时刻）
             if (imuTime < currentCorrectionTime - delta_t)
             {
+                // 若dt为第一帧则设置为1/500
                 double dt = (lastImuT_opt < 0) ? (1.0 / 500.0) : (imuTime - lastImuT_opt);
+
+                // 调用预积分接口将imu数据送进去处理
                 imuIntegratorOpt_->integrateMeasurement(
                         gtsam::Vector3(thisImu->linear_acceleration.x, thisImu->linear_acceleration.y, thisImu->linear_acceleration.z),
                         gtsam::Vector3(thisImu->angular_velocity.x,    thisImu->angular_velocity.y,    thisImu->angular_velocity.z), dt);
-                
+            
                 lastImuT_opt = imuTime;
                 imuQueOpt.pop_front();
             }
@@ -367,18 +388,27 @@ public:
                 break;
         }
         // add imu factor to graph
+        // 两帧间imu预积分完成后，转换为预积分约束
         const gtsam::PreintegratedImuMeasurements& preint_imu = dynamic_cast<const gtsam::PreintegratedImuMeasurements&>(*imuIntegratorOpt_);
+        // 预积分约束对两帧间的位姿、速度、零偏形成约束
         gtsam::ImuFactor imu_factor(X(key - 1), V(key - 1), X(key), V(key), B(key - 1), preint_imu);
+        // 加入因子图
         graphFactors.add(imu_factor);
         // add imu bias between factor
+        // 零偏用常量约束
         graphFactors.add(gtsam::BetweenFactor<gtsam::imuBias::ConstantBias>(B(key - 1), B(key), gtsam::imuBias::ConstantBias(),
                          gtsam::noiseModel::Diagonal::Sigmas(sqrt(imuIntegratorOpt_->deltaTij()) * noiseModelBetweenBias)));
+        
         // add pose factor
+        // lidar补偿到imu坐标系下，作为先验估计
         gtsam::Pose3 curPose = lidarPose.compose(lidar2Imu);
         gtsam::PriorFactor<gtsam::Pose3> pose_factor(X(key), curPose, degenerate ? correctionNoise2 : correctionNoise);
         graphFactors.add(pose_factor);
+            
         // insert predicted values
+        // 根据上一关键帧时刻的状态，结合预积分结果，对当前状态进行预测
         gtsam::NavState propState_ = imuIntegratorOpt_->predict(prevState_, prevBias_);
+        // 预测量作为初始值加入因子图中
         graphValues.insert(X(key), propState_.pose());
         graphValues.insert(V(key), propState_.v());
         graphValues.insert(B(key), prevBias_);
@@ -387,7 +417,9 @@ public:
         optimizer.update();
         graphFactors.resize(0);
         graphValues.clear();
+        
         // Overwrite the beginning of the preintegration for the next step.
+        // 获取优化后的当前状态作为当前帧的最佳估计
         gtsam::Values result = optimizer.calculateEstimate();
         prevPose_  = result.at<gtsam::Pose3>(X(key));
         prevVel_   = result.at<gtsam::Vector3>(V(key));
@@ -395,7 +427,7 @@ public:
         prevBias_  = result.at<gtsam::imuBias::ConstantBias>(B(key));
         // Reset the optimization preintegration object.
         imuIntegratorOpt_->resetIntegrationAndSetBias(prevBias_);
-        // check optimization
+        // check optimization 
         if (failureDetection(prevVel_, prevBias_))
         {
             resetParams();
@@ -475,10 +507,12 @@ public:
         lastImuT_imu = imuTime;
 
         // integrate this single imu message
+        // 每来一个imu就加入到预积分状态中
         imuIntegratorImu_->integrateMeasurement(gtsam::Vector3(thisImu.linear_acceleration.x, thisImu.linear_acceleration.y, thisImu.linear_acceleration.z),
                                                 gtsam::Vector3(thisImu.angular_velocity.x,    thisImu.angular_velocity.y,    thisImu.angular_velocity.z), dt);
 
         // predict odometry
+        // 预测最新状态
         gtsam::NavState currentState = imuIntegratorImu_->predict(prevStateOdom, prevBiasOdom);
 
         // publish odometry
@@ -487,7 +521,7 @@ public:
         odometry.header.frame_id = odometryFrame;
         odometry.child_frame_id = "odom_imu";
 
-        // transform imu pose to ldiar
+        // transform imu pose to lidar
         gtsam::Pose3 imuPose = gtsam::Pose3(currentState.quaternion(), currentState.position());
         gtsam::Pose3 lidarPose = imuPose.compose(imu2Lidar);
 
@@ -520,6 +554,7 @@ int main(int argc, char** argv)
 
     ROS_INFO("\033[1;32m----> IMU Preintegration Started.\033[0m");
     
+    //四个spinner，在某个线程在处理一个特别耗时的回调时被占用，其他线程仍然可以继续接收和处理新的消息。
     ros::MultiThreadedSpinner spinner(4);
     spinner.spin();
     
