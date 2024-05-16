@@ -248,17 +248,18 @@ public:
         std::lock_guard<std::mutex> lock(mtx);
 
         static double timeLastProcessing = -1;
+       //控制处理频率，两帧处理一帧
         if (timeLaserInfoCur - timeLastProcessing >= mappingProcessInterval)
         {
             timeLastProcessing = timeLaserInfoCur;
 
-            updateInitialGuess();
+            updateInitialGuess(); // 提供较为准确的初值
 
-            extractSurroundingKeyFrames();
+            extractSurroundingKeyFrames(); // 提取关键帧构建点云地图
 
-            downsampleCurrentScan();
+            downsampleCurrentScan(); // 当前的点云降采样
 
-            scan2MapOptimization();
+            scan2MapOptimization(); // 当前的点云与局部地图匹配
 
             saveKeyFramesAndFactor();
 
@@ -782,7 +783,7 @@ public:
     
 
 
-
+   // 提供较为准确初值
     void updateInitialGuess()
     {
         // save current transformation before any processing
@@ -790,8 +791,10 @@ public:
 
         static Eigen::Affine3f lastImuTransformation;
         // initialization
+        // 初始时 没有关键帧
         if (cloudKeyPoses3D->points.empty())
         {
+            // 初始位姿由磁力计提供
             transformTobeMapped[0] = cloudInfo.imuRollInit;
             transformTobeMapped[1] = cloudInfo.imuPitchInit;
             transformTobeMapped[2] = cloudInfo.imuYawInit;
@@ -799,6 +802,7 @@ public:
             if (!useImuHeadingInitialization)
                 transformTobeMapped[2] = 0;
 
+           //保存磁力计提供的位姿，平移为0
             lastImuTransformation = pcl::getTransformation(0, 0, 0, cloudInfo.imuRollInit, cloudInfo.imuPitchInit, cloudInfo.imuYawInit); // save imu before return;
             return;
         }
@@ -806,29 +810,42 @@ public:
         // use imu pre-integration estimation for pose guess
         static bool lastImuPreTransAvailable = false;
         static Eigen::Affine3f lastImuPreTransformation;
+
+       // 如果预积分节点开始提供里程计
         if (cloudInfo.odomAvailable == true)
         {
+            // 预积分的位姿转为Eigen
             Eigen::Affine3f transBack = pcl::getTransformation(cloudInfo.initialGuessX,    cloudInfo.initialGuessY,     cloudInfo.initialGuessZ, 
                                                                cloudInfo.initialGuessRoll, cloudInfo.initialGuessPitch, cloudInfo.initialGuessYaw);
-            if (lastImuPreTransAvailable == false)
+           // 是否收到过第一帧的预积分里程计信息 
+           if (lastImuPreTransAvailable == false)
             {
                 lastImuPreTransformation = transBack;
                 lastImuPreTransAvailable = true;
             } else {
+               // 上一个里程计结果与当前里程计结果之间的delta pose
                 Eigen::Affine3f transIncre = lastImuPreTransformation.inverse() * transBack;
+               
+               // 上一帧的最优位姿估计转为eigen
                 Eigen::Affine3f transTobe = trans2Affine3f(transformTobeMapped);
+               
+               //将delta pose加在上一帧的最优位姿估计上，转为当前帧位姿的先验估计
                 Eigen::Affine3f transFinal = transTobe * transIncre;
+
+               //将eigen转为欧拉角与平移的形式
                 pcl::getTranslationAndEulerAngles(transFinal, transformTobeMapped[3], transformTobeMapped[4], transformTobeMapped[5], 
                                                               transformTobeMapped[0], transformTobeMapped[1], transformTobeMapped[2]);
 
                 lastImuPreTransformation = transBack;
 
+               // 磁力计保存备用
                 lastImuTransformation = pcl::getTransformation(0, 0, 0, cloudInfo.imuRollInit, cloudInfo.imuPitchInit, cloudInfo.imuYawInit); // save imu before return;
                 return;
             }
         }
 
         // use imu incremental estimation for pose guess (only rotation)
+        // 如果没有里程计信息，则使用imu的旋转信息来更新，平移置为0
         if (cloudInfo.imuAvailable == true)
         {
             Eigen::Affine3f transBack = pcl::getTransformation(0, 0, 0, cloudInfo.imuRollInit, cloudInfo.imuPitchInit, cloudInfo.imuYawInit);
@@ -859,7 +876,7 @@ public:
         extractCloud(cloudToExtract);
     }
 
-    void extractNearby()
+    void extractNearby() //取出一些关键帧surroundingKeyPosesDS构建地图
     {
         pcl::PointCloud<PointType>::Ptr surroundingKeyPoses(new pcl::PointCloud<PointType>());
         pcl::PointCloud<PointType>::Ptr surroundingKeyPosesDS(new pcl::PointCloud<PointType>());
@@ -868,6 +885,7 @@ public:
 
         // extract all the nearby key poses and downsample them
         kdtreeSurroundingKeyPoses->setInputCloud(cloudKeyPoses3D); // create kd-tree
+       // 以上一个关键帧为圆心，50m为半径，取出索引和距离
         kdtreeSurroundingKeyPoses->radiusSearch(cloudKeyPoses3D->back(), (double)surroundingKeyframeSearchRadius, pointSearchInd, pointSearchSqDis);
         for (int i = 0; i < (int)pointSearchInd.size(); ++i)
         {
@@ -875,6 +893,7 @@ public:
             surroundingKeyPoses->push_back(cloudKeyPoses3D->points[id]);
         }
 
+       // 下采样
         downSizeFilterSurroundingKeyPoses.setInputCloud(surroundingKeyPoses);
         downSizeFilterSurroundingKeyPoses.filter(*surroundingKeyPosesDS);
         for(auto& pt : surroundingKeyPosesDS->points)
@@ -884,36 +903,43 @@ public:
         }
 
         // also extract some latest key frames in case the robot rotates in one position
+       // 提取一些时间上相近的关键帧
         int numPoses = cloudKeyPoses3D->size();
         for (int i = numPoses-1; i >= 0; --i)
-        {
+        {   
+           //最近10s的关键帧保存下来
             if (timeLaserInfoCur - cloudKeyPoses6D->points[i].time < 10.0)
                 surroundingKeyPosesDS->push_back(cloudKeyPoses3D->points[i]);
             else
                 break;
         }
 
+       // 根据提取出来的关键帧进行地图构建
         extractCloud(surroundingKeyPosesDS);
     }
 
     void extractCloud(pcl::PointCloud<PointType>::Ptr cloudToExtract)
     {
         // fuse the map
+       // 角点地图和面点地图
         laserCloudCornerFromMap->clear();
         laserCloudSurfFromMap->clear(); 
         for (int i = 0; i < (int)cloudToExtract->size(); ++i)
         {
+            //简单校验下距离不能太远
             if (pointDistance(cloudToExtract->points[i], cloudKeyPoses3D->back()) > surroundingKeyframeSearchRadius)
                 continue;
-
+            //取出关键帧的索引
             int thisKeyInd = (int)cloudToExtract->points[i].intensity;
             if (laserCloudMapContainer.find(thisKeyInd) != laserCloudMapContainer.end()) 
             {
                 // transformed cloud available
+               // 直接查询是否已经转换过并存储在点云容器中，如果已经转过，直接加入局部地图中
                 *laserCloudCornerFromMap += laserCloudMapContainer[thisKeyInd].first;
                 *laserCloudSurfFromMap   += laserCloudMapContainer[thisKeyInd].second;
             } else {
                 // transformed cloud not available
+                // 转到世界坐标系下
                 pcl::PointCloud<PointType> laserCloudCornerTemp = *transformPointCloud(cornerCloudKeyFrames[thisKeyInd],  &cloudKeyPoses6D->points[thisKeyInd]);
                 pcl::PointCloud<PointType> laserCloudSurfTemp = *transformPointCloud(surfCloudKeyFrames[thisKeyInd],    &cloudKeyPoses6D->points[thisKeyInd]);
                 *laserCloudCornerFromMap += laserCloudCornerTemp;
@@ -924,9 +950,11 @@ public:
         }
 
         // Downsample the surrounding corner key frames (or map)
+        // 对局部地图下采样
         downSizeFilterCorner.setInputCloud(laserCloudCornerFromMap);
         downSizeFilterCorner.filter(*laserCloudCornerFromMapDS);
         laserCloudCornerFromMapDSNum = laserCloudCornerFromMapDS->size();
+       
         // Downsample the surrounding surf key frames (or map)
         downSizeFilterSurf.setInputCloud(laserCloudSurfFromMap);
         downSizeFilterSurf.filter(*laserCloudSurfFromMapDS);
@@ -939,6 +967,7 @@ public:
 
     void extractSurroundingKeyFrames()
     {
+      // 没有关键帧直接返回
         if (cloudKeyPoses3D->points.empty() == true)
             return; 
         
@@ -952,7 +981,7 @@ public:
         extractNearby();
     }
 
-    void downsampleCurrentScan()
+    void downsampleCurrentScan() //当前的点云降采样
     {
         // Downsample cloud from current scan
         laserCloudCornerLastDS->clear();
@@ -1279,11 +1308,12 @@ public:
         return false; // keep optimizing
     }
 
-    void scan2MapOptimization()
+    void scan2MapOptimization()  // 当前的点云与局部地图匹配
     {
         if (cloudKeyPoses3D->points.empty())
             return;
 
+       // 判断降采样后的角点和面点够不够（10角点100面点）
         if (laserCloudCornerLastDSNum > edgeFeatureMinValidNum && laserCloudSurfLastDSNum > surfFeatureMinValidNum)
         {
             kdtreeCornerFromMap->setInputCloud(laserCloudCornerFromMapDS);
