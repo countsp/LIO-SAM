@@ -301,6 +301,7 @@ public:
             return false;
         }
 
+        // 准备imu补偿信息
         imuDeskewInfo();
 
         odomDeskewInfo();
@@ -348,11 +349,14 @@ public:
             }
 
             // get angular velocity
+            // 取出当前帧角速度
             double angular_x, angular_y, angular_z;
             imuAngular2rosAngular(&thisImuMsg, &angular_x, &angular_y, &angular_z);
 
             // integrate rotation
-            double timeDiff = currentImuTime - imuTime[imuPointerCur-1];
+            double timeDiff = currentImuTime - imuTime[-1];
+
+            //计算每个时刻的姿态角，方便后续查找对应每个点云时间的值
             imuRotX[imuPointerCur] = imuRotX[imuPointerCur-1] + angular_x * timeDiff;
             imuRotY[imuPointerCur] = imuRotY[imuPointerCur-1] + angular_y * timeDiff;
             imuRotZ[imuPointerCur] = imuRotZ[imuPointerCur-1] + angular_z * timeDiff;
@@ -389,6 +393,7 @@ public:
         // get start odometry at the beinning of the scan
         nav_msgs::Odometry startOdomMsg;
 
+        // 找到对应最早点云的odom数据
         for (int i = 0; i < (int)odomQueue.size(); ++i)
         {
             startOdomMsg = odomQueue[i];
@@ -399,13 +404,16 @@ public:
                 break;
         }
 
+        // ros消息格式中姿态转为tf格式
         tf::Quaternion orientation;
         tf::quaternionMsgToTF(startOdomMsg.pose.pose.orientation, orientation);
 
+        //四元数转为欧拉角
         double roll, pitch, yaw;
         tf::Matrix3x3(orientation).getRPY(roll, pitch, yaw);
 
         // Initial guess used in mapOptimization
+        //记录起始时刻对应的odom姿态
         cloudInfo.initialGuessX = startOdomMsg.pose.pose.position.x;
         cloudInfo.initialGuessY = startOdomMsg.pose.pose.position.y;
         cloudInfo.initialGuessZ = startOdomMsg.pose.pose.position.z;
@@ -433,17 +441,21 @@ public:
                 break;
         }
 
+        // odom退化了，置信度低
         if (int(round(startOdomMsg.pose.covariance[0])) != int(round(endOdomMsg.pose.covariance[0])))
             return;
 
+        // 起始位姿与结束位姿转为eigen
         Eigen::Affine3f transBegin = pcl::getTransformation(startOdomMsg.pose.pose.position.x, startOdomMsg.pose.pose.position.y, startOdomMsg.pose.pose.position.z, roll, pitch, yaw);
 
         tf::quaternionMsgToTF(endOdomMsg.pose.pose.orientation, orientation);
         tf::Matrix3x3(orientation).getRPY(roll, pitch, yaw);
         Eigen::Affine3f transEnd = pcl::getTransformation(endOdomMsg.pose.pose.position.x, endOdomMsg.pose.pose.position.y, endOdomMsg.pose.pose.position.z, roll, pitch, yaw);
 
+        // 求出起始与结束相对运动
         Eigen::Affine3f transBt = transBegin.inverse() * transEnd;
 
+        //增量转为xyzrpy形式
         float rollIncre, pitchIncre, yawIncre;
         pcl::getTranslationAndEulerAngles(transBt, odomIncreX, odomIncreY, odomIncreZ, rollIncre, pitchIncre, yawIncre);
 
@@ -462,12 +474,21 @@ public:
             ++imuPointerFront;
         }
 
+        // imuPointerBack              imuPointer Front
+        //      x                              x
+        //                    x
+        //             imuPointerFront
+
+        // 如果时间戳不在两个imu之间，直接赋值了
         if (pointTime > imuTime[imuPointerFront] || imuPointerFront == 0)
         {
             *rotXCur = imuRotX[imuPointerFront];
             *rotYCur = imuRotY[imuPointerFront];
             *rotZCur = imuRotZ[imuPointerFront];
         } else {
+            
+            //旋转线性插值
+            
             int imuPointerBack = imuPointerFront - 1;
             double ratioFront = (pointTime - imuTime[imuPointerBack]) / (imuTime[imuPointerFront] - imuTime[imuPointerBack]);
             double ratioBack = (imuTime[imuPointerFront] - pointTime) / (imuTime[imuPointerFront] - imuTime[imuPointerBack]);
@@ -501,22 +522,26 @@ public:
         double pointTime = timeScanCur + relTime;
 
         float rotXCur, rotYCur, rotZCur;
-        findRotation(pointTime, &rotXCur, &rotYCur, &rotZCur);
+        findRotation(pointTime, &rotXCur, &rotYCur, &rotZCur); //旋转插值补偿
 
         float posXCur, posYCur, posZCur;
-        findPosition(relTime, &posXCur, &posYCur, &posZCur);
+        findPosition(relTime, &posXCur, &posYCur, &posZCur); //平移插值补偿（没有实现）
 
         if (firstPointFlag == true)
         {
+            // 计算第一个点相对位姿
             transStartInverse = (pcl::getTransformation(posXCur, posYCur, posZCur, rotXCur, rotYCur, rotZCur)).inverse();
             firstPointFlag = false;
         }
 
         // transform points to start
+        // 计算当前点和第一个点相对位姿
         Eigen::Affine3f transFinal = pcl::getTransformation(posXCur, posYCur, posZCur, rotXCur, rotYCur, rotZCur);
         Eigen::Affine3f transBt = transStartInverse * transFinal;
 
         PointType newPoint;
+        
+        // 新点为 R * p + t ，把点补偿到第一个点对应时刻的位姿
         newPoint.x = transBt(0,0) * point->x + transBt(0,1) * point->y + transBt(0,2) * point->z + transBt(0,3);
         newPoint.y = transBt(1,0) * point->x + transBt(1,1) * point->y + transBt(1,2) * point->z + transBt(1,3);
         newPoint.z = transBt(2,0) * point->x + transBt(2,1) * point->y + transBt(2,2) * point->z + transBt(2,3);
@@ -555,9 +580,11 @@ public:
             int columnIdn = -1;
             if (sensor == SensorType::VELODYNE || sensor == SensorType::OUSTER)
             {
-                // 计算水平角
+                
                 float horizonAngle = atan2(thisPoint.x, thisPoint.y) * 180 / M_PI;
                 static float ang_res_x = 360.0/float(Horizon_SCAN);
+
+                // 计算水平线id，x副方向为起始，顺时针为正方向
                 columnIdn = -round((horizonAngle-90.0)/ang_res_x) + Horizon_SCAN/2;
                 if (columnIdn >= Horizon_SCAN)
                     columnIdn -= Horizon_SCAN;
