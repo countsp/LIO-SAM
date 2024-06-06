@@ -261,13 +261,13 @@ public:
 
             scan2MapOptimization(); // 当前的点云与局部地图匹配
 
-            saveKeyFramesAndFactor();
+            saveKeyFramesAndFactor(); //保存关键帧，添加factor， i-sam优化，取出结果
 
-            correctPoses();
+            correctPoses(); // 更新cloudKeyPoses3D ，6D
 
-            publishOdometry();
+            publishOdometry(); // 发布lidar里程计
 
-            publishFrames();
+            publishFrames(); //发送可视化点云信息
         }
     }
 
@@ -1383,6 +1383,7 @@ public:
 
     bool saveFrame()
     {
+       // 如果没有关键帧，肯定保存下来
         if (cloudKeyPoses3D->points.empty())
             return true;
 
@@ -1392,13 +1393,21 @@ public:
                 return true;
         }
 
+       // 取出所有关键帧的6自由度信息的末尾（上一个关键帧的信息）
         Eigen::Affine3f transStart = pclPointToAffine3f(cloudKeyPoses6D->back());
+
+       // 当前位姿也保存下来
         Eigen::Affine3f transFinal = pcl::getTransformation(transformTobeMapped[3], transformTobeMapped[4], transformTobeMapped[5], 
                                                             transformTobeMapped[0], transformTobeMapped[1], transformTobeMapped[2]);
+       // 获得变换 
         Eigen::Affine3f transBetween = transStart.inverse() * transFinal;
         float x, y, z, roll, pitch, yaw;
+       
+        //转为6自由度
         pcl::getTranslationAndEulerAngles(transBetween, x, y, z, roll, pitch, yaw);
 
+       //任何一个大于给定阈值的旋转  或者 平移大于阈值 则认为是关键帧
+       
         if (abs(roll)  < surroundingkeyframeAddingAngleThreshold &&
             abs(pitch) < surroundingkeyframeAddingAngleThreshold && 
             abs(yaw)   < surroundingkeyframeAddingAngleThreshold &&
@@ -1409,36 +1418,52 @@ public:
     }
 
     void addOdomFactor()
-    {
+    {   
+       //第一帧
         if (cloudKeyPoses3D->points.empty())
         {
+           // 置信度较差，尤其平移和yaw
             noiseModel::Diagonal::shared_ptr priorNoise = noiseModel::Diagonal::Variances((Vector(6) << 1e-2, 1e-2, M_PI*M_PI, 1e8, 1e8, 1e8).finished()); // rad*rad, meter*meter
+            
+           // 添加初始位姿的先验约束给第一个节点
             gtSAMgraph.add(PriorFactor<Pose3>(0, trans2gtsamPose(transformTobeMapped), priorNoise));
-            initialEstimate.insert(0, trans2gtsamPose(transformTobeMapped));
+           // 添加变量
+            initialEstimate.insert(0, trans2gtsamPose(transformTobeMapped)); 
+           
         }else{
+           //不是第一帧，添加帧间约束，置信度高
             noiseModel::Diagonal::shared_ptr odometryNoise = noiseModel::Diagonal::Variances((Vector(6) << 1e-6, 1e-6, 1e-6, 1e-4, 1e-4, 1e-4).finished());
+
             gtsam::Pose3 poseFrom = pclPointTogtsamPose3(cloudKeyPoses6D->points.back());
             gtsam::Pose3 poseTo   = trans2gtsamPose(transformTobeMapped);
+
+           // 帧间约束加入两个节点的id，帧间约束大小，置信度
             gtSAMgraph.add(BetweenFactor<Pose3>(cloudKeyPoses3D->size()-1, cloudKeyPoses3D->size(), poseFrom.between(poseTo), odometryNoise));
+           // 变量节点添加
             initialEstimate.insert(cloudKeyPoses3D->size(), poseTo);
         }
     }
 
     void addGPSFactor()
     {
+       //无GPS
         if (gpsQueue.empty())
             return;
 
         // wait for system initialized and settles down
+       // 如果无关键帧，return
         if (cloudKeyPoses3D->points.empty())
             return;
+           
         else
         {
+           // 刚起步或者会触发回环
             if (pointDistance(cloudKeyPoses3D->front(), cloudKeyPoses3D->back()) < 5.0)
                 return;
         }
 
         // pose covariance small, no need to correct
+        // gtsam反馈当前x,y的置信度较高 ，用不着gps
         if (poseCovariance(3,3) < poseCovThreshold && poseCovariance(4,4) < poseCovThreshold)
             return;
 
@@ -1446,7 +1471,8 @@ public:
         static PointType lastGPSPoint;
 
         while (!gpsQueue.empty())
-        {
+        {   
+            //如果gps时间早于当前时间前0.2s，就舍弃
             if (gpsQueue.front().header.stamp.toSec() < timeLaserInfoCur - 0.2)
             {
                 // message too old
@@ -1454,21 +1480,25 @@ public:
             }
             else if (gpsQueue.front().header.stamp.toSec() > timeLaserInfoCur + 0.2)
             {
-                // message too new
+             // message too new
+             // 太新了，等等
                 break;
             }
             else
             {
+               // GPS时间合理
                 nav_msgs::Odometry thisGPS = gpsQueue.front();
                 gpsQueue.pop_front();
 
-                // GPS too noisy, skip
+                // GPS too noisy, skip 
+                //
                 float noise_x = thisGPS.pose.covariance[0];
                 float noise_y = thisGPS.pose.covariance[7];
                 float noise_z = thisGPS.pose.covariance[14];
+                // 误差大于2m，算了
                 if (noise_x > gpsCovThreshold || noise_y > gpsCovThreshold)
                     continue;
-
+ 
                 float gps_x = thisGPS.pose.pose.position.x;
                 float gps_y = thisGPS.pose.pose.position.y;
                 float gps_z = thisGPS.pose.pose.position.z;
@@ -1487,15 +1517,19 @@ public:
                 curGPSPoint.x = gps_x;
                 curGPSPoint.y = gps_y;
                 curGPSPoint.z = gps_z;
+
+               // 不能太频繁
                 if (pointDistance(curGPSPoint, lastGPSPoint) < 5.0)
                     continue;
                 else
                     lastGPSPoint = curGPSPoint;
 
                 gtsam::Vector Vector3(3);
+               // 置信度Vector3 最小也只设置为1 ， 不特别信任
                 Vector3 << max(noise_x, 1.0f), max(noise_y, 1.0f), max(noise_z, 1.0f);
                 noiseModel::Diagonal::shared_ptr gps_noise = noiseModel::Diagonal::Variances(Vector3);
                 gtsam::GPSFactor gps_factor(cloudKeyPoses3D->size(), gtsam::Point3(gps_x, gps_y, gps_z), gps_noise);
+               //不用再引入新变量，优化的仍然是关键帧信息
                 gtSAMgraph.add(gps_factor);
 
                 aLoopIsClosed = true;
@@ -1509,12 +1543,18 @@ public:
         if (loopIndexQueue.empty())
             return;
 
+       // 将队列里所有回环约束加入
         for (int i = 0; i < (int)loopIndexQueue.size(); ++i)
         {
+           //当前帧与回环帧
             int indexFrom = loopIndexQueue[i].first;
             int indexTo = loopIndexQueue[i].second;
+            
+           // 帧间约束
             gtsam::Pose3 poseBetween = loopPoseQueue[i];
+           // 置信度是icp得分
             gtsam::noiseModel::Diagonal::shared_ptr noiseBetween = loopNoiseQueue[i];
+           //加入约束
             gtSAMgraph.add(BetweenFactor<Pose3>(indexFrom, indexTo, poseBetween, noiseBetween));
         }
 
@@ -1524,11 +1564,12 @@ public:
         aLoopIsClosed = true;
     }
 
-    void saveKeyFramesAndFactor()
+    void saveKeyFramesAndFactor()  //保存关键帧，添加factor
     {
-        if (saveFrame() == false)
+        if (saveFrame() == false)  // 判断如果不是关键帧，返回
             return;
-
+      
+        //判断为 是关键帧
         // odom factor
         addOdomFactor();
 
@@ -1542,6 +1583,7 @@ public:
         // gtSAMgraph.print("GTSAM Graph:\n");
 
         // update iSAM
+        // 多次优化
         isam->update(gtSAMgraph, initialEstimate);
         isam->update();
 
@@ -1554,25 +1596,31 @@ public:
             isam->update();
         }
 
+       // 约束和节点可以清空了，信息已经加入isam中
         gtSAMgraph.resize(0);
         initialEstimate.clear();
 
-        //save key poses
+        // save key poses
+        // 保存关键帧信息
         PointType thisPose3D;
         PointTypePose thisPose6D;
         Pose3 latestEstimate;
 
+        // 取出优化结果
         isamCurrentEstimate = isam->calculateEstimate();
+        // 取出优化后最新关键帧位姿
         latestEstimate = isamCurrentEstimate.at<Pose3>(isamCurrentEstimate.size()-1);
         // cout << "****************************************************" << endl;
         // isamCurrentEstimate.print("Current estimate: ");
 
+       // 取出x,y,z与索引，更新cloudKeyPoses3D
         thisPose3D.x = latestEstimate.translation().x();
         thisPose3D.y = latestEstimate.translation().y();
         thisPose3D.z = latestEstimate.translation().z();
         thisPose3D.intensity = cloudKeyPoses3D->size(); // this can be used as index
         cloudKeyPoses3D->push_back(thisPose3D);
 
+       //// 取出6维信息，更新cloudKeyPoses6D
         thisPose6D.x = thisPose3D.x;
         thisPose6D.y = thisPose3D.y;
         thisPose6D.z = thisPose3D.z;
@@ -1586,9 +1634,12 @@ public:
         // cout << "****************************************************" << endl;
         // cout << "Pose covariance:" << endl;
         // cout << isam->marginalCovariance(isamCurrentEstimate.size()-1) << endl << endl;
-        poseCovariance = isam->marginalCovariance(isamCurrentEstimate.size()-1);
+       
+       // 保存协方差矩阵（置信度）
+       poseCovariance = isam->marginalCovariance(isamCurrentEstimate.size()-1);
 
         // save updated transform
+       // 将优化后的位姿更新到transformTobeMapped中，作为当前最佳估计值
         transformTobeMapped[0] = latestEstimate.rotation().roll();
         transformTobeMapped[1] = latestEstimate.rotation().pitch();
         transformTobeMapped[2] = latestEstimate.rotation().yaw();
@@ -1603,6 +1654,7 @@ public:
         pcl::copyPointCloud(*laserCloudSurfLastDS,    *thisSurfKeyFrame);
 
         // save key frame cloud
+       // 关键帧的点云保存下来
         cornerCloudKeyFrames.push_back(thisCornerKeyFrame);
         surfCloudKeyFrames.push_back(thisSurfKeyFrame);
 
@@ -1610,18 +1662,22 @@ public:
         updatePath(thisPose6D);
     }
 
-    void correctPoses()
+    void correctPoses()  // 更新cloudKeyPoses3D ，6D
     {
         if (cloudKeyPoses3D->points.empty())
             return;
 
+       // 如果有回环或者GPS启用，则触发
         if (aLoopIsClosed == true)
         {
             // clear map cache
+            // 位姿会更新，直接清空
             laserCloudMapContainer.clear();
             // clear path
             globalPath.poses.clear();
+           
             // update key poses
+           // 更新cloudKeyPoses3D ，cloudKeyPoses6D
             int numPoses = isamCurrentEstimate.size();
             for (int i = 0; i < numPoses; ++i)
             {
@@ -1636,6 +1692,7 @@ public:
                 cloudKeyPoses6D->points[i].pitch = isamCurrentEstimate.at<Pose3>(i).rotation().pitch();
                 cloudKeyPoses6D->points[i].yaw   = isamCurrentEstimate.at<Pose3>(i).rotation().yaw();
 
+               // 更新path
                 updatePath(cloudKeyPoses6D->points[i]);
             }
 
@@ -1663,6 +1720,7 @@ public:
     void publishOdometry()
     {
         // Publish odometry for ROS (global)
+        // 发布当前帧位姿
         nav_msgs::Odometry laserOdometryROS;
         laserOdometryROS.header.stamp = timeLaserInfoStamp;
         laserOdometryROS.header.frame_id = odometryFrame;
@@ -1674,6 +1732,7 @@ public:
         pubLaserOdometryGlobal.publish(laserOdometryROS);
         
         // Publish TF
+        // 发布lidar在odom坐标系下tf
         static tf::TransformBroadcaster br;
         tf::Transform t_odom_to_lidar = tf::Transform(tf::createQuaternionFromRPY(transformTobeMapped[0], transformTobeMapped[1], transformTobeMapped[2]),
                                                       tf::Vector3(transformTobeMapped[3], transformTobeMapped[4], transformTobeMapped[5]));
@@ -1681,6 +1740,7 @@ public:
         br.sendTransform(trans_odom_to_lidar);
 
         // Publish odometry for ROS (incremental)
+        // 给imu预积分提供增量位姿变换，需要平滑的里程计
         static bool lastIncreOdomPubFlag = false;
         static nav_msgs::Odometry laserOdomIncremental; // incremental odometry msg
         static Eigen::Affine3f increOdomAffine; // incremental odometry in affine
@@ -1690,6 +1750,7 @@ public:
             laserOdomIncremental = laserOdometryROS;
             increOdomAffine = trans2Affine3f(transformTobeMapped);
         } else {
+           // scan-map前.inverse * scan-map 后
             Eigen::Affine3f affineIncre = incrementalOdometryAffineFront.inverse() * incrementalOdometryAffineBack;
             increOdomAffine = increOdomAffine * affineIncre;
             float x, y, z, roll, pitch, yaw;
