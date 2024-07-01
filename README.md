@@ -77,6 +77,13 @@ git clone https://github.com/TixiaoShan/LIO-SAM.git
 cd ..
 catkin_make
 ```
+## 修改源码 modification
+
+#include <opencv2/opencv.hpp> instead of #include <opencv/cv.h>
+
+Configure CMakeLists.txt to use set(CMAKE_CXX_FLAGS "-std=c++14") instead of set(CMAKE_CXX_FLAGS "-std=c++11")
+
+Move #include <opencv2/opencv.hpp> after the pcl headers
 
 ## Using Docker
 Build image (based on ROS1 Kinetic):
